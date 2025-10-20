@@ -370,6 +370,15 @@ pub fn threadEnter(
     try self.backend.threadEnter(self.alloc, self, data);
     errdefer self.backend.threadExit(data);
 
+    // Send initial pwd_change to trigger title_command if enabled in Surface config.
+    if (self.terminal.getPwd()) |pwd| {
+        if (apprt.surface.Message.WriteReq.init(self.alloc, pwd)) |req| {
+            _ = self.surface_mailbox.push(.{ .pwd_change = req }, .{ .forever = {} });
+        } else |err| {
+            log.debug("failed to send initial pwd err={}", .{err});
+        }
+    }
+
     // If we have inputs, then queue them all up.
     for (inputs orelse &.{}) |input| switch (input) {
         .string => |v| self.queueWrite(data, v, false) catch |err| {

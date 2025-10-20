@@ -1296,6 +1296,37 @@ fullscreen: bool = false,
 /// to get the new title.
 title: ?[:0]const u8 = null,
 
+/// Execute a shell command to determine the window title dynamically. Runs
+/// whenever the working directory changes. The first line of stdout becomes
+/// the window title. When set, this overrides both the `title` config and
+/// title escape sequences from programs.
+///
+/// Execution: Commands run asynchronously with the terminal's working directory
+/// and Ghostty's base environment (not shell profile variables). Timeout after
+/// 1 second shows `[title_command timed out]`. Non-zero exit or signals show
+/// `[title_command failed]`. Empty output falls back to directory basename.
+///
+/// Security: Shell mode executes via `/bin/sh -c`, inheriting Ghostty's base
+/// environment. For safer invocations, use `direct:` mode to bypass shell expansion
+/// and wildcard interpretation.
+///
+/// Modes:
+///   - Shell (default): Wrapped in `/bin/sh -c` (subject to shell expansion)
+///   - Direct: Prefix with `direct:` to execute without shell wrapper
+///
+/// Examples:
+///   title-command = basename "$PWD"
+///   title-command = git branch --show-current 2>/dev/null
+///   title-command = direct:/usr/bin/fish -c 'basename (pwd)'
+///   title-command = direct:/usr/bin/zsh -c 'print -P %~'
+///
+/// This configuration can be reloaded at runtime.
+///
+/// Unix-like systems only (macOS, Linux, FreeBSD, etc.). Not available on
+/// Windows (OSC 7 not supported).
+@"title-command": if (builtin.os.tag == .windows) void else ?Command = if (builtin.os.tag == .windows)
+{} else null,
+
 /// The setting that will change the application class value.
 ///
 /// This controls the class field of the `WM_CLASS` X11 property (when running

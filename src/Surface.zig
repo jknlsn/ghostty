@@ -33,14 +33,155 @@ const font = @import("font/main.zig");
 const Command = @import("Command.zig");
 const terminal = @import("terminal/main.zig");
 const configpkg = @import("config.zig");
+const ConfigCommand = configpkg.Command;
 const Duration = configpkg.Config.Duration;
 const input = @import("input.zig");
 const App = @import("App.zig");
 const internal_os = @import("os/main.zig");
 const inspectorpkg = @import("inspector/main.zig");
 const SurfaceMouse = @import("surface_mouse.zig");
+const title_command = @import("surface_title_command.zig");
 
 const log = std.log.scoped(.surface);
+
+const TitleCommandJob = struct {
+    surface: *Surface,
+    command: ConfigCommand,
+    pwd_z: [:0]u8,
+    generation: u64,
+};
+
+/// Schedules a title command to be executed in a background thread.
+/// The command is executed with the given working directory.
+/// Results are delivered via the surface mailbox.
+///
+/// Ownership: Takes ownership of `pwd_z`. On any error, this function frees `pwd_z`.
+fn scheduleTitleCommand(
+    self: *Surface,
+    command: ConfigCommand,
+    pwd_z: [:0]u8,
+) !void {
+    if (self.title_command_shutdown.load(.acquire)) {
+        self.alloc.free(pwd_z);
+        return;
+    }
+
+    const command_copy = try command.clone(self.alloc);
+    errdefer command_copy.deinit(self.alloc);
+    errdefer self.alloc.free(pwd_z);
+
+    const job = try self.alloc.create(TitleCommandJob);
+    errdefer self.alloc.destroy(job);
+
+    const generation = self.title_command_generation.fetchAdd(1, .seq_cst) + 1;
+
+    job.* = .{
+        .surface = self,
+        .command = command_copy,
+        .pwd_z = pwd_z,
+        .generation = generation,
+    };
+
+    _ = self.title_command_active.fetchAdd(1, .seq_cst);
+    errdefer _ = self.title_command_active.fetchSub(1, .seq_cst);
+
+    const thread = try std.Thread.spawn(
+        .{},
+        titleCommandThread,
+        .{job},
+    );
+    thread.detach();
+}
+
+/// Background thread function that executes a title command and sends the result.
+/// This function always frees the job structure before returning.
+fn titleCommandThread(job: *TitleCommandJob) void {
+    const surface = job.surface;
+    const alloc = surface.alloc;
+
+    // Cleanup: free pwd memory, destroy job, and decrement active counter.
+    // This defer ensures cleanup happens even if we return early.
+    defer {
+        job.command.deinit(alloc);
+        alloc.free(job.pwd_z);
+        alloc.destroy(job);
+        const prev_count = surface.title_command_active.fetchSub(1, .seq_cst);
+
+        // If this was the last active job, signal the condition variable
+        // so that deinit() can wake up and proceed with shutdown
+        if (prev_count == 1) {
+            surface.title_command_mutex.lock();
+            defer surface.title_command_mutex.unlock();
+            surface.title_command_cond.signal();
+        }
+    }
+
+    // If we're shutting down we don't bother sending a result.
+    if (surface.title_command_shutdown.load(.acquire)) return;
+
+    var timed_out = false;
+    var command_failed = false;
+    const run_result = title_command.run(
+        alloc,
+        job.command,
+        job.pwd_z,
+    ) catch |err| switch (err) {
+        error.Timeout => blk: {
+            log.warn("title command timed out after {}s", .{title_command.timeout_ns / std.time.ns_per_s});
+            timed_out = true;
+            break :blk title_command.RunResult{ .output = null, .failed = false };
+        },
+        else => blk: {
+            log.warn("title command execution failed err={}", .{err});
+            command_failed = true;
+            break :blk title_command.RunResult{ .output = null, .failed = true };
+        },
+    };
+    defer if (run_result.output) |buf| alloc.free(buf);
+    command_failed = command_failed or run_result.failed;
+    const maybe_output = run_result.output;
+
+    // Check shutdown again after command execution - shutdown may have been
+    // triggered while the command was running (up to 1 second)
+    if (surface.title_command_shutdown.load(.acquire)) return;
+
+    // Skip sending result if a newer command has been scheduled.
+    // This prevents stale titles from overwriting newer ones.
+    const latest = surface.title_command_generation.load(.seq_cst);
+    if (job.generation != latest) return;
+
+    // Determine the title to use: timeout message, command output, or fallback.
+    const title_slice: []const u8 = blk: {
+        if (timed_out) break :blk title_command.timeout_message;
+        if (command_failed) break :blk title_command.failed_message;
+        if (maybe_output) |buf| break :blk buf;
+        break :blk title_command.fallbackTitleFromPwd(job.pwd_z);
+    };
+
+    // Check shutdown before allocating to prevent crash during deinit
+    if (surface.title_command_shutdown.load(.acquire)) return;
+
+    const title_req = apprt.surface.Message.WriteReq.init(alloc, title_slice) catch |err| {
+        log.warn("failed to store title command result err={}", .{err});
+        return;
+    };
+
+    const mailbox: App.Mailbox = .{
+        .rt_app = surface.rt_app,
+        .mailbox = &surface.app.mailbox,
+    };
+    _ = mailbox.push(.{
+        .surface_message = .{
+            .surface = surface,
+            .message = .{
+                .title_command_result = .{
+                    .generation = job.generation,
+                    .title = title_req,
+                },
+            },
+        },
+    }, .{ .forever = {} });
+}
 
 // The renderer implementation to use.
 const Renderer = rendererpkg.Renderer;
@@ -154,6 +295,22 @@ selection_scroll_active: bool = false,
 /// actual time, but we must be able to compare two subsequent timestamps to get
 /// the wall clock time that has elapsed between timestamps.
 command_timer: ?std.time.Instant = null,
+
+/// Mutex protecting title command synchronization primitives
+title_command_mutex: std.Thread.Mutex = .{},
+
+/// Condition variable for signaling when all title command jobs complete
+title_command_cond: std.Thread.Condition = .{},
+
+/// Tracks the number of in-flight title command jobs.
+title_command_active: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+/// Indicates that the surface is shutting down so we no longer schedule jobs.
+title_command_shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+/// The most recent generation of a scheduled title command.
+/// Used to track which command is newest and discard stale results.
+title_command_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
 /// The effect of an input event. This can be used by callers to take
 /// the appropriate action after an input event. For example, key
@@ -285,6 +442,7 @@ const DerivedConfig = struct {
     window_height: u32,
     window_width: u32,
     title: ?[:0]const u8,
+    title_command: ?ConfigCommand,
     title_report: bool,
     links: []Link,
     link_previews: configpkg.LinkPreviews,
@@ -359,6 +517,12 @@ const DerivedConfig = struct {
             .window_height = config.@"window-height",
             .window_width = config.@"window-width",
             .title = config.title,
+            .title_command = if (comptime builtin.os.tag == .windows)
+                null
+            else if (config.@"title-command") |cmd|
+                try cmd.clone(alloc)
+            else
+                null,
             .title_report = config.@"title-report",
             .links = links,
             .link_previews = config.@"link-previews",
@@ -374,7 +538,10 @@ const DerivedConfig = struct {
     }
 
     pub fn deinit(self: *DerivedConfig) void {
+        // Cleanup resources that have non-memory state (e.g., C objects)
         for (self.links) |*link| link.regex.deinit();
+        // title_command is arena-allocated, so arena.deinit() will reclaim it.
+        // No manual cleanup needed for pure arena allocations.
         self.arena.deinit();
     }
 
@@ -684,6 +851,9 @@ pub fn init(
             .set_title,
             .{ .title = title },
         );
+    } else if (config.@"title-command") |_| {
+        // title-command is set - skip fallback titles to avoid flash.
+        // Initial title will be set when threadEnter triggers pwd_change.
     } else if ((comptime builtin.os.tag == .linux) and
         config.@"_xdg-terminal-exec")
     xdg: {
@@ -726,6 +896,25 @@ pub fn init(
 }
 
 pub fn deinit(self: *Surface) void {
+    self.title_command_shutdown.store(true, .release);
+
+    // Wait for all title command jobs to complete using a condition variable.
+    // Use a timeout to prevent indefinite hangs if a thread is stuck.
+    self.title_command_mutex.lock();
+    defer self.title_command_mutex.unlock();
+    const timeout_ns = 5 * std.time.ns_per_s; // 5 seconds
+    const start = std.time.Instant.now() catch null;
+    while (self.title_command_active.load(.acquire) != 0) {
+        if (start) |s| {
+            const elapsed = (std.time.Instant.now() catch s).since(s);
+            if (elapsed >= timeout_ns) {
+                log.warn("timeout waiting for title command jobs to complete, proceeding with shutdown", .{});
+                break;
+            }
+        }
+        self.title_command_cond.timedWait(&self.title_command_mutex, 100 * std.time.ns_per_ms) catch {};
+    }
+
     // Stop rendering thread
     {
         self.renderer_thread.stop.notify() catch |err|
@@ -858,9 +1047,11 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         .change_config => |config| try self.updateConfig(config),
 
         .set_title => |*v| {
-            // We ignore the message in case the title was set via config.
-            if (self.config.title != null) {
-                log.debug("ignoring title change request since static title is set via config", .{});
+            // Ignore title escape sequences if title is set via config.
+            if (self.config.title != null or
+                self.config.title_command != null)
+            {
+                log.debug("ignoring title escape sequence, title controlled by config", .{});
                 return;
             }
 
@@ -957,14 +1148,50 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         .pwd_change => |w| {
             defer w.deinit();
 
-            // We always allocate for this because we need to null-terminate.
-            const str = try self.alloc.dupeZ(u8, w.slice());
-            defer self.alloc.free(str);
+            const pwd_z = try self.alloc.dupeZ(u8, w.slice());
+            defer self.alloc.free(pwd_z);
 
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .pwd,
-                .{ .pwd = str },
+                .{ .pwd = pwd_z },
+            );
+
+            // If title_command is enabled, execute it
+            if (self.config.title_command) |cmd| {
+                const job_pwd_z = try self.alloc.dupeZ(u8, pwd_z);
+                self.scheduleTitleCommand(cmd, job_pwd_z) catch |err| {
+                    log.warn("failed to schedule title command err={}", .{err});
+                };
+            }
+        },
+
+        .title_command_result => |result| {
+            if (self.config.title_command == null) {
+                result.title.deinit();
+                return;
+            }
+
+            // Discard stale results from concurrent title commands.
+            const latest = self.title_command_generation.load(.seq_cst);
+            if (result.generation != latest) {
+                result.title.deinit();
+                return;
+            }
+
+            defer result.title.deinit();
+
+            const title_slice = result.title.slice();
+            const title_z = self.alloc.dupeZ(u8, title_slice) catch |err| {
+                log.warn("failed to allocate title command string err={}", .{err});
+                return;
+            };
+            defer self.alloc.free(title_z);
+
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .set_title,
+                .{ .title = title_z },
             );
         },
 
@@ -1569,13 +1796,23 @@ pub fn updateConfig(
         log.warn("failed to notify renderer of config change err={}", .{err});
     };
 
-    // If we have a title set then we update our window to have the
-    // newly configured title.
-    if (config.title) |title| _ = try self.rt_app.performAction(
-        .{ .surface = self },
-        .set_title,
-        .{ .title = title },
-    );
+    // If we have a title set via config, update the window title.
+    if (config.@"title-command") |cmd| {
+        if (self.io.terminal.getPwd()) |current_pwd| {
+            const pwd_z = try self.alloc.dupeZ(u8, current_pwd);
+            self.scheduleTitleCommand(cmd, pwd_z) catch |err| {
+                log.warn("failed to schedule title command err={}", .{err});
+            };
+        } else {
+            log.debug("terminal pwd not available, title_command will not execute", .{});
+        }
+    } else if (config.title) |title| {
+        _ = try self.rt_app.performAction(
+            .{ .surface = self },
+            .set_title,
+            .{ .title = title },
+        );
+    }
 
     // Notify the window
     _ = try self.rt_app.performAction(

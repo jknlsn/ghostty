@@ -166,6 +166,16 @@ pub const Command = union(enum) {
         };
     }
 
+    pub fn deinit(self: *const Self, alloc: Allocator) void {
+        switch (self.*) {
+            .shell => |v| alloc.free(v),
+            .direct => |v| {
+                for (v) |arg| alloc.free(arg);
+                alloc.free(v);
+            },
+        }
+    }
+
     pub fn formatEntry(self: Self, formatter: formatterpkg.EntryFormatter) !void {
         switch (self) {
             .shell => |v| try formatter.formatEntry([]const u8, v),
